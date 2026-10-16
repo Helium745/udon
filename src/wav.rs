@@ -1,3 +1,5 @@
+mod adpcm;
+
 use crate::source::{ChannelCount, Sample, SampleRate, Source};
 use std::sync::Arc;
 
@@ -5,6 +7,9 @@ use std::sync::Arc;
 ///
 /// This type is constructed by passing the entire .wav file contents in as bytes. That is to say, the entire file
 /// must be provided at once, and the WavPlayer will take ownership of it.
+///
+/// Supported encodings are integer PCM (8, 16, 24 or 32 bits), 32-bit float, and 4-bit IMA or Microsoft ADPCM.
+/// ADPCM is decoded one block at a time during playback, so it's never fully expanded into memory.
 ///
 /// Once created, the file contents will be atomically reference-counted, so making multiple copies of this type using
 /// .clone() is relatively costless. Cloning the player is useful if you intend to play it more than once.
@@ -19,6 +24,7 @@ pub struct WavPlayer {
     next_sample_offset: usize,
     format: Format,
     length: usize,
+    adpcm: Option<adpcm::Decoder>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +48,8 @@ pub enum Format {
     I24,
     I32,
     F32,
+    ImaAdpcm,
+    MsAdpcm,
 }
 
 impl WavPlayer {
@@ -94,6 +102,8 @@ impl WavPlayer {
             (1, 24) => Format::I24,
             (1, 32) => Format::I32,
             (3, 32) => Format::F32,
+            (0x02, 4) => Format::MsAdpcm,
+            (0x11, 4) => Format::ImaAdpcm,
             (-2, 8) if ext_guid == Some(data_format_pcm) => Format::U8,
             (-2, 16) if ext_guid == Some(data_format_pcm) => Format::I16,
             (-2, 24) if ext_guid == Some(data_format_pcm) => Format::I24,
@@ -110,11 +120,25 @@ impl WavPlayer {
         let expected_file_length = data_len + data_start;
         if expected_file_length > file.len() {
             return Err(Error::MalformedData)
-        } else {
-            file.truncate(expected_file_length);
         }
 
+        let adpcm = match format {
+            Format::ImaAdpcm | Format::MsAdpcm => {
+                let fact_frames = find_section(&file, b"fact")
+                    .and_then(|(start, len)| if len >= 4 { file.get(start..(start + 4)) } else { None })
+                    .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]) as usize);
+                Some(adpcm::Decoder::new(format, fmt, channels.get(), data_start, data_len, fact_frames)?)
+            },
+            _ => None,
+        };
+
+        file.truncate(expected_file_length);
+
         let sample_bytes = usize::from(sample_bits / 8);
+        let length = match &adpcm {
+            Some(decoder) => decoder.length(),
+            None => data_len / sample_bytes,
+        };
 
         Ok(Self {
             file: file.into(),
@@ -124,7 +148,8 @@ impl WavPlayer {
             data_start,
             next_sample_offset: data_start,
             format,
-            length: data_len / sample_bytes,
+            length,
+            adpcm,
         })
     }
 
@@ -147,6 +172,10 @@ impl Source for WavPlayer {
 
     fn write_samples(&mut self, buffer: &mut [Sample]) -> usize {
         use std::convert::TryInto;
+
+        if let Some(decoder) = &mut self.adpcm {
+            return decoder.write_samples(&self.file, buffer)
+        }
 
         if let Some(i) = self.file.get(self.next_sample_offset..) {
             let output_iter = buffer.iter_mut();
@@ -182,6 +211,7 @@ impl Source for WavPlayer {
                     samples_written = iter.len();
                     iter.for_each(|(out, b)| *out = get_sample_f32(b));
                 },
+                Format::ImaAdpcm | Format::MsAdpcm => unreachable!("ADPCM is handled by adpcm::Decoder"),
             }
 
             self.next_sample_offset += samples_written * self.sample_bytes;
@@ -193,6 +223,9 @@ impl Source for WavPlayer {
 
     fn reset(&mut self) {
         self.next_sample_offset = self.data_start;
+        if let Some(decoder) = &mut self.adpcm {
+            decoder.reset();
+        }
     }
 }
 
